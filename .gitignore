@@ -13,7 +13,6 @@ output/
 outputs/
 demo_outputs/
 eval_results/
-runs/
 validation_results*/
 labeled_visualization/
 labeled_visualization*/
