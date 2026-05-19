@@ -1,0 +1,64 @@
+# 大文件 / 本地数据（不上传）
+inits
+inits/
+datas
+datas/
+checkpoints/
+work_dirs/
+wkdrs/
+wkdrs*/
+wkdrs_*/
+wkdirs/
+output/
+outputs/
+demo_outputs/
+eval_results/
+runs/
+validation_results*/
+labeled_visualization/
+labeled_visualization*/
+training_samples_visualization/
+test_images/
+
+# 模型权重
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# 日志
+*.log
+nohup.out
+*.out
+stage2_training_*.log
+
+# IDE / Cursor
+.vscode/
+.idea/
+.cursor/
+
+# 评估结果与媒体（按需保留代码仓内 README 图可再放开）
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.mp4
+
+# 其他
+.gradio/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# 本地脚本备份（可选）
+*.bak

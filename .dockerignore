@@ -1,0 +1,71 @@
+# Git相关
+.git
+.gitignore
+.gitattributes
+
+# Python相关
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+.pytest_cache
+.coverage
+htmlcov
+
+# 环境相关
+.env
+.venv
+venv/
+env/
+
+# IDE相关
+.vscode
+.idea
+.cursor
+*.swp
+*.swo
+*~
+
+# 日志文件
+*.log
+logs/
+
+# 工作目录和输出
+inits/
+checkpoints/
+datas/
+wkdrs/
+wkdrs*/
+wkdrs_*/
+work_dirs/
+runs/
+eval_results/
+labeled_visualization/
+labeled_visualization*/
+training_samples_visualization/
+validation_results*/
+
+# 数据文件
+test_images/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# 文档和图片
+*.md
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+
+.DS_Store
+Thumbs.db
