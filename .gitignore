@@ -50,7 +50,7 @@ stage2_training_*.log
 *.jpeg
 *.gif
 *.bmp
-*.mp4
+#*.mp4
 
 # 其他
 .gradio/

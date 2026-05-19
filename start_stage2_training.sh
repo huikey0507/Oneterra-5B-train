@@ -26,10 +26,15 @@ SKYSCRIPT_JSON_FILE="datas/img_conv_data/skyscript/skyscript.json"
 
 # 外部数据路径（可通过环境变量覆盖，或直接修改下面的默认路径）
 # 如果数据在项目目录外，请设置环境变量或修改下面的路径
-SKYSCRIPT_IMAGE_DIR="${SKYSCRIPT_IMAGE_DIR:-/mnt/si001883vtjl/yangsen/datasets}"
-SAR_TRAIN_JSON="${SAR_TRAIN_JSON:-/mnt/si001883vtjl/yangsen/datasets/sar_total/pretraining/train.json}"
-SAR_VAL_JSON="${SAR_VAL_JSON:-/mnt/si001883vtjl/yangsen/datasets/sar_total/pretraining/val.json}"
-SAR_IMAGE_DIR="${SAR_IMAGE_DIR:-/mnt/si001883vtjl/yangsen/datasets}"
+#SKYSCRIPT_IMAGE_DIR="${SKYSCRIPT_IMAGE_DIR:-/mnt/si001883vtjl/yangsen/datasets}"
+#SAR_TRAIN_JSON="${SAR_TRAIN_JSON:-/mnt/si001883vtjl/yangsen/datasets/sar_total/pretraining/train.json}"
+#SAR_VAL_JSON="${SAR_VAL_JSON:-/mnt/si001883vtjl/yangsen/datasets/sar_total/pretraining/val.json}"
+#SAR_IMAGE_DIR="${SAR_IMAGE_DIR:-/mnt/si001883vtjl/yangsen/datasets}"
+
+SKYSCRIPT_IMAGE_DIR="${SKYSCRIPT_IMAGE_DIR:-/mnt_llm_A100_V1/yangsen/datasets}"
+SAR_TRAIN_JSON="${SAR_TRAIN_JSON:-/mnt_llm_A100_V1/yangsen/datasets/sar_total/pretraining/train.json}"
+SAR_VAL_JSON="${SAR_VAL_JSON:-/mnt_llm_A100_V1/yangsen/datasets/sar_total/pretraining/val.json}"
+SAR_IMAGE_DIR="${SAR_IMAGE_DIR:-/mnt_llm_A100_V1/yangsen/datasets}"
 
 # Stage 1权重路径（相对路径）
 S1_CHECKPOINT="checkpoints/s1_seg_finetune/pytorch_model.bin"
@@ -155,6 +160,13 @@ echo "=========================================="
 echo ""
 
 cd ${PROJECT_DIR}
+
+# 将数据路径传入训练配置（xsam_s2_align_pretrain_skyscript_sar.py 会读取这些环境变量）
+export YANGSEN_DATASETS_ROOT="${SAR_IMAGE_DIR}"
+export SAR_DATA_ROOT="$(dirname "${SAR_TRAIN_JSON}")"
+export SAR_TRAIN_JSON="${SAR_TRAIN_JSON}"
+export SAR_VAL_JSON="${SAR_VAL_JSON}"
+export SAR_IMAGE_DIR="${SAR_IMAGE_DIR}"
 
 # 设置分布式训练端口（避免端口冲突）
 # 如果端口被占用，可以修改这个值或通过环境变量 MASTER_PORT 覆盖

@@ -43,13 +43,13 @@ skyscript_image_folder = data_dir + "img_conv_data/skyscript/"
 
 # Data - SAR数据集
 # /mnt/si001883vtjl/
-sar_data_root = "/mnt/si001883vtjl/yangsen/datasets/sar_total/pretraining"
-#sar_data_root = "/mnt_llm_A100_V1/yangsen/datasets/sar_total/pretraining"
+#sar_data_root = "/mnt/si001883vtjl/yangsen/datasets/sar_total/pretraining"
+sar_data_root = "/mnt_llm_A100_V1/yangsen/datasets/sar_total/pretraining"
 sar_train_data_path = sar_data_root + "/train.json"
 sar_val_data_path = sar_data_root + "/val.json"
 # SAR数据集的图片路径格式：sarclip/xxx.png 或 sar_text/Image/xxx.jpg，所以image_folder应该是datasets根目录
-sar_image_folder = "/mnt/si001883vtjl/yangsen/datasets"
-#sar_image_folder = "/mnt_llm_A100_V1/yangsen/datasets"
+#sar_image_folder = "/mnt/si001883vtjl/yangsen/datasets"
+sar_image_folder = "/mnt_llm_A100_V1/yangsen/datasets"
 
 prompt_template = PROMPT_TEMPLATE.phi3_chat
 max_length = int(4096 - (384 / 14) ** 2 - 1024)
