@@ -87,7 +87,7 @@ model = dict(
     connector_hidden_dim=512,
     connector_scale_factor=[4, 2, 1, 0.5],
     # 加载第一阶段COCO数据集训练的预训练权重
-    s1_pretrained_pth=root_dir + "checkpoints/s1_seg_finetune/xsam_sam_large_m2f_e36_gpu16_seg_finetune/pytorch_model.bin",
+    s1_pretrained_pth=root_dir + "checkpoints/s1_seg_finetune/coco_pretrain/pytorch_model.bin",
     segmentor=dict(
         type=XSegmentor,
         encoder=dict(

@@ -401,16 +401,56 @@ class BaseDataset(Dataset):
 
     def _decode_mask(self):
         pass
-
+    
     def __getitem__(self, index):
         index = index % self.data_length
-
-        # s1：无 image_processor，与 X-SAM 一致，不做坏图重试
-        if self.image_processor is None:
-            data_dict = copy.deepcopy(self.data[index])
+        max_skip = 32  # 遇到损坏/截断图像时最多尝试后续 32 个样本，避免单张坏图导致训练中断
+        last_error = None
+        
+        for attempt in range(max_skip):
+            idx = (index + attempt) % self.data_length
+            data_dict = copy.deepcopy(self.data[idx])
+            
             if data_dict.get("image_file", None) is not None:
-                image_path = _resolve_image_path(self.image_folder, data_dict["image_file"])
-                pil_image = Image.open(image_path).convert("RGB")
+                image_file = data_dict["image_file"]
+                # 使用辅助函数解析图像路径（处理重复前缀问题）
+                image_path = _resolve_image_path(self.image_folder, image_file)
+                
+                try:
+                    pil_image = Image.open(image_path).convert("RGB")
+                except OSError as e:
+                    last_error = e
+                    print_log(
+                        f"Skipping corrupted/truncated image (attempt {attempt + 1}/{max_skip}): {image_path}: {e}",
+                        level="WARNING",
+                    )
+                    continue  # 尝试下一个样本
+                
+                # ========== 图像处理（与 X-SAM 一致：s1 等阶段可无 image_processor）==========
+                if self.image_processor is not None:
+                    image = pil_image
+                    actual_image_processor = self.image_processor
+                    if hasattr(self.image_processor, "image_processor"):
+                        inner = self.image_processor.image_processor
+                        if inner is not None:
+                            actual_image_processor = inner
+
+                    if self.pad_image_to_square:
+                        if hasattr(actual_image_processor, "image_mean"):
+                            image_mean = actual_image_processor.image_mean
+                        elif hasattr(self.image_processor, "image_mean"):
+                            image_mean = self.image_processor.image_mean
+                        else:
+                            image_mean = [0.5, 0.5, 0.5]
+                        image = expand2square(pil_image, tuple(int(x * 255) for x in image_mean))
+
+                    if hasattr(actual_image_processor, "preprocess"):
+                        image = actual_image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+                    else:
+                        image = actual_image_processor(image, return_tensors="pt")["pixel_values"][0]
+                    data_dict["pixel_values"] = image
+
+                # 额外图像处理器（mask 相关）
                 if self.extra_image_processor is not None:
                     data_dict.update(self._decode_mask(data_dict))
                     seg_output = self.extra_image_processor.preprocess(
@@ -420,89 +460,26 @@ class BaseDataset(Dataset):
                     data_dict["scaled_size"] = tuple(seg_output["scaled_sizes"][0].tolist())
                     data_dict["mask_labels"] = seg_output.get("mask_labels", None)
                     data_dict["task_name"] = self.task_name
+                # ========== 图像处理结束 ==========
+                
+                # 编码和返回（成功加载图像的分支）
                 data_dict.update(self._get_input_ids(data_dict, with_image_token=True))
                 data_dict.update(self._get_cond_ids(data_dict))
                 data_dict.update(self._get_seg_ids(data_dict))
+                return data_dict  # 成功，直接返回
+            
             else:
-                if self.extra_image_processor is not None:
-                    if hasattr(self.extra_image_processor, "crop_size"):
-                        crop_size = self.extra_image_processor.crop_size
-                    else:
-                        crop_size = self.extra_image_processor.size
-                    data_dict["seg_pixel_values"] = torch.zeros(3, crop_size["height"], crop_size["width"])
-                    data_dict["image_info"] = {"image_file": None}
-                    data_dict["scaled_size"] = (crop_size["height"], crop_size["width"])
-                    data_dict["image_size"] = {"height": crop_size["height"], "width": crop_size["width"]}
-                    data_dict["mask_labels"] = torch.zeros(0, crop_size["height"], crop_size["width"])
-                    data_dict["class_labels"] = torch.zeros(0)
-                    data_dict["task_name"] = self.task_name
-                data_dict.update(self._get_input_ids(data_dict, with_image_token=False))
-                data_dict.update(self._get_cond_ids(data_dict))
-                data_dict.update(self._get_seg_ids(data_dict))
-            return data_dict
-
-        # s2/s3：有 image_processor，坏图最多跳过 32 个样本
-        max_skip = 32
-        last_error = None
-        for attempt in range(max_skip):
-            idx = (index + attempt) % self.data_length
-            data_dict = copy.deepcopy(self.data[idx])
-            if data_dict.get("image_file", None) is None:
+                # 没有 image_file 的情况，跳出循环用默认空图
                 break
-
-            image_path = _resolve_image_path(self.image_folder, data_dict["image_file"])
-            try:
-                pil_image = Image.open(image_path).convert("RGB")
-            except OSError as e:
-                last_error = e
-                print_log(
-                    f"Skipping corrupted/truncated image (attempt {attempt + 1}/{max_skip}): "
-                    f"{image_path}: {e}",
-                    level="WARNING",
-                )
-                continue
-
-            image = pil_image
-            actual_image_processor = self.image_processor
-            if hasattr(self.image_processor, "image_processor"):
-                inner = getattr(self.image_processor, "image_processor", None)
-                if inner is not None:
-                    actual_image_processor = inner
-            if self.pad_image_to_square:
-                if hasattr(actual_image_processor, "image_mean"):
-                    image_mean = actual_image_processor.image_mean
-                elif hasattr(self.image_processor, "image_mean"):
-                    image_mean = self.image_processor.image_mean
-                else:
-                    image_mean = [0.5, 0.5, 0.5]
-                image = expand2square(pil_image, tuple(int(x * 255) for x in image_mean))
-            if hasattr(actual_image_processor, "preprocess"):
-                image = actual_image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+        
+        # ========== 所有尝试都失败，或没有 image_file，返回空图 ==========
+        if self.image_processor is not None:
+            if hasattr(self.image_processor, "crop_size"):
+                crop_size = self.image_processor.crop_size
             else:
-                image = actual_image_processor(image, return_tensors="pt")["pixel_values"][0]
-            data_dict["pixel_values"] = image
+                crop_size = self.image_processor.size
+            data_dict["pixel_values"] = torch.zeros(3, crop_size["height"], crop_size["width"])
 
-            if self.extra_image_processor is not None:
-                data_dict.update(self._decode_mask(data_dict))
-                seg_output = self.extra_image_processor.preprocess(
-                    pil_image, data_dict["mask_labels"], return_tensors="pt"
-                )
-                data_dict["seg_pixel_values"] = seg_output["pixel_values"][0]
-                data_dict["scaled_size"] = tuple(seg_output["scaled_sizes"][0].tolist())
-                data_dict["mask_labels"] = seg_output.get("mask_labels", None)
-                data_dict["task_name"] = self.task_name
-
-            data_dict.update(self._get_input_ids(data_dict, with_image_token=True))
-            data_dict.update(self._get_cond_ids(data_dict))
-            data_dict.update(self._get_seg_ids(data_dict))
-            return data_dict
-
-        data_dict = copy.deepcopy(self.data[index % self.data_length])
-        if hasattr(self.image_processor, "crop_size"):
-            crop_size = self.image_processor.crop_size
-        else:
-            crop_size = self.image_processor.size
-        data_dict["pixel_values"] = torch.zeros(3, crop_size["height"], crop_size["width"])
         if self.extra_image_processor is not None:
             if hasattr(self.extra_image_processor, "crop_size"):
                 crop_size = self.extra_image_processor.crop_size
@@ -515,11 +492,102 @@ class BaseDataset(Dataset):
             data_dict["mask_labels"] = torch.zeros(0, crop_size["height"], crop_size["width"])
             data_dict["class_labels"] = torch.zeros(0)
             data_dict["task_name"] = self.task_name
+        
         data_dict.update(self._get_input_ids(data_dict, with_image_token=False))
         data_dict.update(self._get_cond_ids(data_dict))
         data_dict.update(self._get_seg_ids(data_dict))
+        
+        # 如果是因为错误导致的退出，抛出异常
         if last_error is not None:
             raise RuntimeError(
-                f"Unable to load valid image after {max_skip} attempts. Last error: {last_error}"
+                f"Unable to load valid image after {max_skip} attempts. "
+                f"Last error: {last_error}"
             ) from last_error
+        
         return data_dict
+
+    # def __getitem__(self, index):
+    #     index = index % self.data_length
+    #     max_skip = 32  # 遇到损坏/截断图像时最多尝试后续 32 个样本，避免单张坏图导致训练中断
+    #     last_error = None
+    #     for attempt in range(max_skip):
+    #         idx = (index + attempt) % self.data_length
+    #         data_dict = copy.deepcopy(self.data[idx])
+    #         if data_dict.get("image_file", None) is not None:
+    #             image_file = data_dict["image_file"]
+    #             # 使用辅助函数解析图像路径（处理重复前缀问题）
+    #             image_path = _resolve_image_path(self.image_folder, image_file)
+    #             try:
+    #                 pil_image = Image.open(image_path).convert("RGB")
+    #             except OSError as e:
+    #                 last_error = e
+    #                 print_log(
+    #                     f"Skipping corrupted/truncated image (attempt {attempt + 1}/{max_skip}): {image_path}: {e}",
+    #                     level="WARNING",
+    #                 )
+    #                 continue
+    #             if self.image_processor is not None:
+    #             image = pil_image
+    #             # 如果 image_processor 是 SiglipProcessor，需要使用内部的 image_processor 属性
+    #             actual_image_processor = self.image_processor
+    #             if hasattr(self.image_processor, 'image_processor'):
+    #                 actual_image_processor = self.image_processor.image_processor
+                
+    #             if self.pad_image_to_square:
+    #                 # 获取 image_mean，优先使用 actual_image_processor 的，否则使用外层的
+    #                 if hasattr(actual_image_processor, 'image_mean'):
+    #                     image_mean = actual_image_processor.image_mean
+    #                 elif hasattr(self.image_processor, 'image_mean'):
+    #                     image_mean = self.image_processor.image_mean
+    #                 else:
+    #                     # 默认值（SigLIP 的标准均值）
+    #                     image_mean = [0.5, 0.5, 0.5]
+    #                 image = expand2square(pil_image, tuple(int(x * 255) for x in image_mean))
+                
+    #             # 使用实际的图像处理器处理图像
+    #             if hasattr(actual_image_processor, 'preprocess'):
+    #                 image = actual_image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+    #             else:
+    #                 image = actual_image_processor(image, return_tensors="pt")["pixel_values"][0]
+    #             data_dict["pixel_values"] = image
+    #         if self.extra_image_processor is not None:
+    #             data_dict.update(self._decode_mask(data_dict))
+    #             seg_output = self.extra_image_processor.preprocess(
+    #                 pil_image, data_dict["mask_labels"], return_tensors="pt"
+    #             )
+    #             data_dict["seg_pixel_values"] = seg_output["pixel_values"][0]
+    #             data_dict["scaled_size"] = tuple(seg_output["scaled_sizes"][0].tolist())
+    #             data_dict["mask_labels"] = seg_output.get("mask_labels", None)
+    #             data_dict["task_name"] = self.task_name
+    #         data_dict.update(self._get_input_ids(data_dict, with_image_token=True))
+    #         data_dict.update(self._get_cond_ids(data_dict))
+    #         data_dict.update(self._get_seg_ids(data_dict))
+    #         return data_dict
+    #     else:
+    #         if hasattr(self.image_processor, "crop_size"):
+    #             crop_size = self.image_processor.crop_size
+    #         else:
+    #             crop_size = self.image_processor.size
+    #         data_dict["pixel_values"] = torch.zeros(3, crop_size["height"], crop_size["width"])
+    #         if self.extra_image_processor is not None:
+    #             if hasattr(self.extra_image_processor, "crop_size"):
+    #                 crop_size = self.extra_image_processor.crop_size
+    #             else:
+    #                 crop_size = self.extra_image_processor.size
+    #             data_dict["seg_pixel_values"] = torch.zeros(3, crop_size["height"], crop_size["width"])
+    #             data_dict["image_info"] = {"image_file": None}
+    #             data_dict["scaled_size"] = (crop_size["height"], crop_size["width"])
+    #             data_dict["image_size"] = {"height": crop_size["height"], "width": crop_size["width"]}
+    #             data_dict["mask_labels"] = torch.zeros(0, crop_size["height"], crop_size["width"])
+    #             data_dict["class_labels"] = torch.zeros(0)
+    #             data_dict["task_name"] = self.task_name
+    #         data_dict.update(self._get_input_ids(data_dict, with_image_token=False))
+    #         data_dict.update(self._get_cond_ids(data_dict))
+    #         data_dict.update(self._get_seg_ids(data_dict))
+    #         return data_dict
+    #     if last_error is not None:
+    #         raise last_error
+    #     raise RuntimeError(
+    #         "Unable to load any image after 32 attempts (all corrupted or truncated). "
+    #         "Please check your image data."
+    #     )
