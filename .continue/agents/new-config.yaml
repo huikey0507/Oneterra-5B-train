@@ -1,0 +1,34 @@
+name: Local Config
+version: 1.0.0
+schema: v1
+models:
+  # --- 之前配置的模型 ---
+  - name: DeepSeek V4 Pro (内网)
+    provider: openai
+    model: DeepSeek-V4-pro-zj
+    apiBase: http://10.200.95.16:30300/v1
+    apiKey: "sk-请替换成你的真实密钥"
+    roles:
+      - chat
+      - edit
+      - apply
+
+  - name: Claude 4.7 Opus (内网)
+    provider: openai
+    model: cla4-7-opus-zj
+    apiBase: http://10.200.95.16:30300/v1
+    apiKey: "sk-请替换成你的真实密钥"
+    roles:
+      - chat
+      - edit
+      - apply
+
+  - name: Qwen3.5 Flash (内网)
+    provider: openai
+    model: qwen3.5-flash-zj
+    apiBase: http://10.200.95.16:30300/v1
+    apiKey: "sk-请替换成你的真实密钥"
+    roles:
+      - chat
+      - edit
+      - apply

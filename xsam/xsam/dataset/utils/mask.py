@@ -4,6 +4,13 @@ import torch
 from pycocotools import mask as mask_utils
 
 
+def _merge_mask(binary_mask, mask, height, width):
+    mask = np.asarray(mask).squeeze().astype(np.int8)
+    if mask.shape != (height, width):
+        raise ValueError(f"decoded mask shape mismatch: expected {(height, width)}, got {mask.shape}")
+    return np.maximum(binary_mask, mask)
+
+
 def decode_mask(segmentation, height, width):
     binary_mask = np.zeros((height, width), dtype=np.int8)
     if isinstance(segmentation, list) and len(segmentation) == 0:
@@ -15,18 +22,18 @@ def decode_mask(segmentation, height, width):
             seg_copy = dict(segmentation)
             seg_copy["counts"] = seg_copy["counts"].decode("utf-8")
             segmentation = seg_copy
-        mask = mask_utils.decode(segmentation).astype(np.int8)
-        binary_mask = np.maximum(binary_mask, mask.squeeze())
+        mask = mask_utils.decode(segmentation)
+        binary_mask = _merge_mask(binary_mask, mask, height, width)
     elif isinstance(segmentation[0], dict):
         for seg in segmentation:
-            mask = mask_utils.decode(seg).astype(np.int8)
-            binary_mask = np.maximum(binary_mask, mask.squeeze())
+            mask = mask_utils.decode(seg)
+            binary_mask = _merge_mask(binary_mask, mask, height, width)
     elif isinstance(segmentation[0], list):
         for seg in segmentation:
             rles = mask_utils.frPyObjects([seg], height, width)
             rle = mask_utils.merge(rles)
             mask = mask_utils.decode(rle)
-            binary_mask = np.maximum(binary_mask, mask.squeeze())
+            binary_mask = _merge_mask(binary_mask, mask, height, width)
     else:
         raise ValueError(f"Invalid segmentation type: {type(segmentation)}")
 

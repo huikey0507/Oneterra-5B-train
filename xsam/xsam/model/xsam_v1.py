@@ -1,3 +1,4 @@
+# Backup: xsam.py before frozen-encoder memory fixes (git HEAD @ 5e922d5).
 import math
 import os.path as osp
 from collections import OrderedDict
@@ -190,20 +191,18 @@ class XSamModel(BaseModel):
                 else:
                     self.llm.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-            if self.visual_encoder is not None and not self.freeze_visual_encoder:
+            if self.visual_encoder is not None:
                 if hasattr(self.visual_encoder, "enable_input_require_grads"):
                     self.visual_encoder.enable_input_require_grads()
                 else:
                     self.visual_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-            if self.visual_encoder is not None and hasattr(self, "visual_projector"):
                 self.visual_projector.enable_input_require_grads()
 
-            if self.segmentor is not None and not self.freeze_segmentor_encoder:
+            if self.segmentor is not None:
                 if hasattr(self.segmentor, "enable_input_require_grads"):
                     self.segmentor.enable_input_require_grads()
                 else:
                     self.segmentor.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-            if self.segmentor is not None:
                 if hasattr(self, "seg_projector"):
                     self.seg_projector.enable_input_require_grads()
                 if hasattr(self, "llm_projector"):
@@ -445,67 +444,54 @@ class XSamModel(BaseModel):
             attrs = [attrs]
         return [getattr(data_samples, attr, None) if data_samples is not None else None for attr in attrs]
 
-    def _forward_visual_encoder(self, pixel_values):
-        pixel_values = pixel_values.to(self.visual_encoder.dtype)
-        if self.freeze_visual_encoder:
-            with torch.no_grad():
-                return self.visual_encoder(pixel_values, output_hidden_states=True)
-        return self.visual_encoder(pixel_values, output_hidden_states=True)
-
-    def _forward_segmentor_encoder(self, seg_pixel_values):
-        seg_pixel_values = seg_pixel_values.to(self.segmentor.dtype)
-        if self.freeze_segmentor_encoder:
-            with torch.no_grad():
-                return self.segmentor.encoder(
-                    seg_pixel_values,
-                    output_hidden_states=True,
-                    output_attentions=False,
-                )
-        return self.segmentor.encoder(
-            seg_pixel_values,
-            output_hidden_states=True,
-            output_attentions=False,
-        )
-
     def forward(self, data_dict, data_samples=None, mode="loss", **kwargs):
         if data_samples is not None:
             data_samples = data_sample_to_device(data_samples, device=get_device())
 
         extra_data_dict = {}
         if "pixel_values" in data_dict and self.visual_encoder is not None:
-            visual_outputs = self._forward_visual_encoder(data_dict["pixel_values"])
+            visual_outputs = self.visual_encoder(
+                data_dict["pixel_values"].to(self.visual_encoder.dtype),
+                output_hidden_states=True,
+            )
             pixel_values = self.visual_projector(
                 visual_outputs.hidden_states[self.visual_select_layer][:, self.visual_select_indx :]
             )
             data_dict["pixel_values"] = pixel_values.to(self.llm.dtype)
-            del visual_outputs
 
         if "seg_pixel_values" in data_dict and self.segmentor is not None:
             if self.extract_seg_embeds:
-                seg_visual_outputs = self._forward_segmentor_encoder(data_dict["seg_pixel_values"])
-                seg_hidden_states = seg_visual_outputs.hidden_states
+                seg_visual_outputs = self.segmentor.encoder(
+                    data_dict["seg_pixel_values"].to(self.segmentor.dtype),
+                    output_hidden_states=True,
+                    output_attentions=False,
+                )
                 seg_image_embeddings = (
                     seg_visual_outputs.last_hidden_state
                     if hasattr(seg_visual_outputs, "last_hidden_state")
-                    else seg_hidden_states[-1].transpose(1, 2)
+                    else seg_visual_outputs.hidden_states[-1].transpose(1, 2)
                 )
                 seg_pixel_values = None
                 if hasattr(self, "seg_projector"):
-                    seg_pixel_values = self.seg_projector(seg_hidden_states[self.visual_select_layer])
+                    seg_pixel_values = self.seg_projector(seg_visual_outputs.hidden_states[self.visual_select_layer])
                     seg_pixel_values = seg_pixel_values.to(self.llm.dtype)
+                #################
                 if hasattr(self, "seg_connector"):
-                    seg_image_embeddings = self.seg_connector(
-                        [seg_hidden_states[i] for i in self.seg_select_layers]
-                    )
+                   seg_image_embeddings = self.seg_connector(
+                       [seg_visual_outputs.hidden_states[i] for i in self.seg_select_layers]
+                   )
+                
                 elif self.segmentor.pixel_decoder is not None and hasattr(seg_visual_outputs, "feature_maps"):
                     seg_image_embeddings = seg_visual_outputs.feature_maps
 
+                # here, seg_pixel_values is seg_projector output
                 data_dict["seg_pixel_values"] = seg_pixel_values
                 extra_data_dict = {
                     "seg_pixel_values": None,
                     "seg_image_embeddings": seg_image_embeddings,
                 }
-                del seg_visual_outputs, seg_hidden_states
+                #print(f"🔍 forward中设置extra_data_dict: seg_image_embeddings = {[feat.shape for feat in seg_image_embeddings] if seg_image_embeddings is not None else None}")
+                del seg_visual_outputs
             else:
                 # here, seg_pixel_values is image_processor output
                 extra_data_dict = {

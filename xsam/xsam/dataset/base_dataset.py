@@ -483,7 +483,16 @@ class BaseDataset(Dataset):
             data_dict["pixel_values"] = image
 
             if self.extra_image_processor is not None:
-                data_dict.update(self._decode_mask(data_dict))
+                try:
+                    data_dict.update(self._decode_mask(data_dict))
+                except Exception as e:
+                    last_error = e
+                    print_log(
+                        f"Skipping sample due to mask decode failure (attempt {attempt + 1}/{max_skip}): "
+                        f"image_id={data_dict.get('image_id', '?')} image_file={data_dict.get('image_file', '?')}: {e}",
+                        level="WARNING",
+                    )
+                    continue
                 seg_output = self.extra_image_processor.preprocess(
                     pil_image, data_dict["mask_labels"], return_tensors="pt"
                 )

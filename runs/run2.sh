@@ -19,11 +19,11 @@ code_name="xsam"
 code_dir="$root_dir"
 data_dir="$root_dir/datas"
 init_dir="$root_dir/inits"
-work_dir="${WORK_DIR:-$root_dir/wkdrs}"
+work_dir="${WORK_DIR:-$root_dir/wkdrs_optimization_20260611}"
 if [[ "$work_dir" == "$root_dir/wkdrs" || "$work_dir" == "$root_dir/wkdrs/" ]]; then
     :
 elif [[ -z "${WORK_DIR:-}" ]]; then
-    work_dir="$root_dir/wkdrs"
+    work_dir="$root_dir/wkdrs_optimization_20260611"
 fi
 export ROOT_DIR="$root_dir/"
 export DATA_DIR="$data_dir/"

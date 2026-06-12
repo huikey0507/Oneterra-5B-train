@@ -42,14 +42,21 @@ class REFER:
     def __init__(self, data_root, dataset="refcoco"):
         # print_log(f"Loading {dataset} dataset into memory...", logger="current")
         self.ROOT_DIR = osp.abspath(osp.dirname(__file__))
-        # For "fast" (and similar), data_root is already the dataset root (e.g. .../refseg/FAST)
+        # For "fast" (and *_sample 目录), data_root 已是数据集根目录
         if dataset == "fast":
             self.DATA_DIR = osp.abspath(data_root)
         else:
             self.DATA_DIR = osp.join(data_root, dataset)
         self.IMAGE_DIR = self._get_image_dir(data_root, dataset)
 
-        splitBy = "umd" if dataset == "refcocog" else "unc"
+        if dataset == "refcocog":
+            splitBy = "umd"
+        elif dataset == "risbench":
+            splitBy = "unc"  # RISBench 使用 unc 作为 splitBy
+        elif dataset == "rrsisd":
+            splitBy = "unc"  # RRSIS-D 使用 unc 作为 splitBy
+        else:
+            splitBy = "unc"
         self.data = self._load_data(splitBy)
         self.createIndex()
 
@@ -62,6 +69,12 @@ class REFER:
             return osp.join(data_root, "images/remotesam_images")
         elif dataset == "fast":
             return osp.join(data_root, "images")
+        elif dataset == "risbench":
+            # RISBench 使用独立的图片目录
+            return osp.join(data_root, "../RISBench_dataset/img_rgb")
+        elif dataset == "rrsisd":
+            # RRSIS-D 使用独立的图片目录
+            return osp.join(data_root, "../images/rrsisd/JPEGImages")
         else:
             raise ValueError(f"No refer dataset is called [{dataset}]")
 
