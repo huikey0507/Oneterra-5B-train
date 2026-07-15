@@ -2,6 +2,7 @@
 import copy
 import itertools
 import json
+import logging
 import os
 import os.path as osp
 import random
@@ -16,7 +17,7 @@ from ..utils.constants import DEFAULT_PEND_TOKEN, DEFAULT_PSTART_TOKEN, DEFAULT_
 from .base_dataset import BaseDataset
 from .utils.catalog import MetadataCatalog
 from .utils.coco import COCO
-from .utils.mask import decode_mask
+from .utils.mask import decode_mask, is_segmentation_decodable
 from .utils.refer import REFER
 
 SPECIAL_TOKENS = [DEFAULT_PEND_TOKEN, DEFAULT_PSTART_TOKEN, DEFAULT_SEG_TOKEN]
@@ -123,9 +124,33 @@ class ReferSegDataset(BaseDataset):
 
         return coco_data
 
+    @staticmethod
+    def _normalize_ann_segmentation(ann):
+        segmentation = ann["segmentation"]
+        if isinstance(segmentation, list) and len(segmentation) > 0 and isinstance(segmentation[0], dict):
+            return dict(ann, segmentation=segmentation[0])
+        return ann
+
+    def _filter_valid_anns(self, anns, height, width):
+        valid_anns = []
+        for ann in anns:
+            norm_ann = self._normalize_ann_segmentation(ann)
+            if is_segmentation_decodable(norm_ann["segmentation"], height, width):
+                valid_anns.append(norm_ann)
+            else:
+                self.skipped_bad_mask_cnt += 1
+                print_log(
+                    f"Filtered undecodable mask: image_id={ann.get('image_id', '?')} ann_id={ann.get('id', '?')} "
+                    f"({self.data_name})",
+                    logger="current",
+                    level=logging.WARNING,
+                )
+        return valid_anns
+
     def _load_ann_data(self):
         # 固定随机种子，使多进程/多卡构建的数据集一致，避免 DistributedSampler 因长度不一致崩溃
         random.seed(42)
+        self.skipped_bad_mask_cnt = 0
         coco_data = self._convert_to_coco_format()
         coco_api = COCO(dataset=coco_data)
         img_ids = sorted(coco_api.getImgIds())
@@ -135,10 +160,7 @@ class ReferSegDataset(BaseDataset):
             _img_info = coco_api.loadImgs(img_id)[0]
             ann_ids = coco_api.getAnnIds(imgIds=[img_id])
             anns = coco_api.loadAnns(ann_ids)
-            _anns = [
-                (dict(ann, segmentation=ann["segmentation"][0]) if isinstance(ann["segmentation"][0], dict) else ann)
-                for ann in anns
-            ]
+            _anns = self._filter_valid_anns(anns, _img_info["height"], _img_info["width"])
             if len(_anns) == 0:
                 self.woann_cnt += 1
                 continue
@@ -219,6 +241,12 @@ class ReferSegDataset(BaseDataset):
             self._set_metadata(gt_json=temp_file)
         else:
             self._set_metadata()
+
+        if self.skipped_bad_mask_cnt > 0:
+            print_log(
+                f"Filtered {self.skipped_bad_mask_cnt} annotations with undecodable masks in {self.data_name}.",
+                logger="current",
+            )
 
         del coco_data
         return rets

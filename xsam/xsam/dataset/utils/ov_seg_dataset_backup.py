@@ -25,23 +25,6 @@ class OVSegDataset(GenericSegDataset):
         super().custom_init(**kwargs)
         self.label_file = kwargs.get("label_file", None)
         self.label_shift = kwargs.get("label_shift", 0)
-        # Train-time category name synonym augmentation (prompt text only).
-        self.use_cat_synonym = kwargs.get("use_cat_synonym", False)
-        self.cat_synonym_keep_prob = kwargs.get("cat_synonym_keep_prob", 0.5)
-
-    def _get_input_ids(self, data_dict, with_image_token=True):
-        if (
-            self.use_cat_synonym
-            and self.data_mode == "train"
-            and data_dict.get("sampled_cats") is not None
-        ):
-            from .utils.cat_synonyms import apply_cat_synonyms
-
-            data_dict["sampled_cats"] = apply_cat_synonyms(
-                data_dict["sampled_cats"],
-                keep_prob=self.cat_synonym_keep_prob,
-            )
-        return super()._get_input_ids(data_dict, with_image_token=with_image_token)
 
     def _set_semantic_metadata(self, coco_data, **kwargs):
         metadata = MetadataCatalog.get(f"{self.data_name}")

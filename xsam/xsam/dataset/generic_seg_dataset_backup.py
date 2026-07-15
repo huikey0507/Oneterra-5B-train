@@ -50,9 +50,6 @@ class GenericSegDataset(BaseDataset):
     def custom_init(self, **kwargs):
         self.use_variant_cat = kwargs.get("use_variant_cat", False)
         self.use_full_cat = kwargs.get("use_full_cat", True)
-        # Probability of entering the pos+neg subset branch when both
-        # use_full_cat and use_variant_cat are True (else -> full catalog).
-        self.variant_subset_prob = kwargs.get("variant_subset_prob", 0.5)
         self.caption_data_path = kwargs.get("caption_data_path", None)
         self.panseg_map_folder = kwargs.get("panseg_map_folder", None)
         self.semseg_map_folder = kwargs.get("semseg_map_folder", None)
@@ -179,7 +176,7 @@ class GenericSegDataset(BaseDataset):
         sampled_anns = anns
         if self.data_mode == "train":
             if self.use_full_cat and self.use_variant_cat:
-                if random.random() < self.variant_subset_prob:
+                if random.random() < 0.5:
                     neg_num = max(self.sample_num - len(pos_cat_ids), 0)
                     neg_cat_ids = _sample(neg_cat_ids, random.randint(0, neg_num))
                     sampled_cat_ids = _sample(pos_cat_ids + neg_cat_ids)

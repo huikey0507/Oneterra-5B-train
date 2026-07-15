@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import json
+import logging
 import multiprocessing as mp
 import os
 import os.path as osp
@@ -18,7 +19,7 @@ from xsam.utils.logging import print_log
 from .base_dataset import BaseDataset
 from .utils.catalog import MetadataCatalog
 from .utils.coco import COCO
-from .utils.mask import decode_mask, encode_mask
+from .utils.mask import decode_mask, encode_mask, is_segmentation_decodable
 
 
 class ReasonSegDataset(BaseDataset):
@@ -281,6 +282,7 @@ class ReasonSegDataset(BaseDataset):
         return coco_data
 
     def _load_ann_data(self):
+        self.skipped_bad_mask_cnt = 0
         coco_data = self._convert_to_coco_format()
         print_log(f"Finished processing images. Total: {len(coco_data['images'])}, No annotation: {self.woann_cnt}", logger="current")
 
@@ -291,6 +293,20 @@ class ReasonSegDataset(BaseDataset):
             img_info = coco_api.loadImgs([img_id])[0]
             ann_ids = coco_api.getAnnIds(imgIds=[img_id])
             anns = coco_api.loadAnns(ann_ids)
+            height, width = img_info["height"], img_info["width"]
+            valid_anns = []
+            for ann in anns:
+                if is_segmentation_decodable(ann.get("segmentation"), height, width):
+                    valid_anns.append(ann)
+                else:
+                    self.skipped_bad_mask_cnt += 1
+                    print_log(
+                        f"Filtered undecodable mask: image_id={img_id} ann_id={ann.get('id', '?')} "
+                        f"({self.data_name})",
+                        logger="current",
+                        level=logging.WARNING,
+                    )
+            anns = valid_anns
 
             if len(anns) == 0:
                 self.woann_cnt += 1
@@ -361,6 +377,12 @@ class ReasonSegDataset(BaseDataset):
             self._set_metadata(gt_json=temp_file)
         else:
             self._set_metadata()
+
+        if self.skipped_bad_mask_cnt > 0:
+            print_log(
+                f"Filtered {self.skipped_bad_mask_cnt} annotations with undecodable masks in {self.data_name}.",
+                logger="current",
+            )
 
         del coco_data
         return rets
