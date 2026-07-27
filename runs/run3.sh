@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # set -x
 #
-# run2.sh - 第三阶段多节点训练启动脚本
+# run3.sh - 第三阶段多节点训练启动脚本
 # 集群需提供环境变量：TQ_GPU_NUM（每节点GPU数）、WORLD_SIZE（节点数）、RANK（当前节点秩）、MASTER_ADDR、MASTER_PORT
 # 示例：bash runs/run2.sh --modes train --config xsam/configs/.../s3_mixed_fineture_base/xxx.py --suffix v1
 
@@ -19,11 +19,11 @@ code_name="xsam"
 code_dir="$root_dir"
 data_dir="$root_dir/datas"
 init_dir="$root_dir/inits"
-work_dir="${WORK_DIR:-$root_dir/wkdrs_optimization_20260611}"
+work_dir="${WORK_DIR:-$root_dir/wkdrs_optimization_20260715_v3.2}"
 if [[ "$work_dir" == "$root_dir/wkdrs" || "$work_dir" == "$root_dir/wkdrs/" ]]; then
     :
 elif [[ -z "${WORK_DIR:-}" ]]; then
-    work_dir="$root_dir/wkdrs_optimization_20260624_v3.1"
+    work_dir="$root_dir/wkdrs_optimization_20260715_v3.2"
 fi
 export ROOT_DIR="$root_dir/"
 export DATA_DIR="$data_dir/"
@@ -39,11 +39,14 @@ export XTUNER_DATASET_TIMEOUT=120
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 export NCCL_NET_GDR_LEVEL=2
-export MKL_NUM_THREADS=4
-export OMP_NUM_THREADS=4
-export NCCL_TIMEOUT=7200
-export DIST_TIMEOUT=7200
-export TORCH_DISTRIBUTED_TIMEOUT="${TORCH_DISTRIBUTED_TIMEOUT:-72000}"
+export MKL_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+# NCCL 超时（秒）：多节点加载/广播权重常超过 30min，设为 2h；单 iter 真卡死时最多等 2h 后失败
+# 单位：NCCL_TIMEOUT/DIST_TIMEOUT 秒；TORCH_DISTRIBUTED_DEFAULT_TIMEOUT 毫秒
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-7200}"
+export DIST_TIMEOUT="${DIST_TIMEOUT:-7200}"
+export TORCH_DISTRIBUTED_TIMEOUT="${TORCH_DISTRIBUTED_TIMEOUT:-7200}"
+export TORCH_DISTRIBUTED_DEFAULT_TIMEOUT="${TORCH_DISTRIBUTED_DEFAULT_TIMEOUT:-7200000}"
 
 # 多节点 NCCL 配置（跨节点通信）
 # ---------------------------------------------------------------------------
@@ -63,17 +66,18 @@ export NCCL_NSOCKS_PERTHREAD=4
 export NCCL_SOCKET_NTHREADS=2
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^docker0,lo}"
-export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+#export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+export NCCL_P2P_DISABLE=0 
 export NCCL_SHM_DISABLE=0
 export NCCL_BLOCKING_WAIT=0
 export NCCL_TREE_THRESHOLD=0
+#export NCCL_DEBUG=INFO
 # 使用 InfiniBand 时，可适当增大超时避免瞬断误报（单位秒，默认 18）
 [ -z "${NCCL_IB_TIMEOUT:-}" ] && export NCCL_IB_TIMEOUT=23
 
-# ProcessGroupNCCL watchdog：多节点 64 卡时易误报 480s 挂起，增大心跳超时或关闭监控
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
-# 若仍报 watchdog hang，可取消下行注释以关闭 watchdog：export TORCH_NCCL_ENABLE_MONITORING=0
-export TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-1}"
+# ProcessGroupNCCL watchdog：加载阶段 CUDA 长时间阻塞易误报，关闭监控；心跳与 NCCL 超时对齐 2h
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-7200}"
+export TORCH_NCCL_ENABLE_MONITORING="${TORCH_NCCL_ENABLE_MONITORING:-0}"
 # 多节点断连时，让所有 rank 在同一 collective 上一起失败，便于定位（可选）
 # export TORCH_NCCL_BLOCKING_WAIT=1
 
@@ -265,7 +269,7 @@ for mode in "${modes[@]}"; do
     trained_flag=0
     if [ "$mode" = "train" ]; then
         echo -e "$log_format Training $model_name (multi-node)."
-        echo -e "$log_format NCCL_TIMEOUT=${NCCL_TIMEOUT}s, TORCH_DISTRIBUTED_TIMEOUT=${TORCH_DISTRIBUTED_TIMEOUT}s"
+        echo -e "$log_format NCCL_TIMEOUT=${NCCL_TIMEOUT}s ($((${NCCL_TIMEOUT}/60))min), TORCH_DISTRIBUTED_TIMEOUT=${TORCH_DISTRIBUTED_TIMEOUT}s, TORCH_NCCL_ENABLE_MONITORING=${TORCH_NCCL_ENABLE_MONITORING}"
         torchrun_args="--nproc_per_node=$nproc_per_node --nnodes=$nnodes --node_rank=$node_rank --master_addr=$master_addr --master_port=$master_port"
         echo -e "$log_format torchrun $torchrun_args"
         PYTHONPATH="$(realpath $code_dir)":$PYTHONPATH OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \

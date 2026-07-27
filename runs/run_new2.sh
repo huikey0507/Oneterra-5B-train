@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # set -x
+# run_new2.sh: 基于 run_new.sh，修复从外部 .pth 权重 load_from 续训时
+# --resume auto 会误从 work_dir 加载 pytorch_model.bin 导致 DeepSpeed AssertionError 的问题。
 
 #######################################################################
 #                          PART 1  Logging                             #
@@ -245,12 +247,25 @@ do
         # 验证 NCCL 超时环境变量
         echo -e "$log_format NCCL_TIMEOUT=$NCCL_TIMEOUT seconds ($(($NCCL_TIMEOUT/3600)) hours)"
         echo -e "$log_format DIST_TIMEOUT=$DIST_TIMEOUT seconds ($(($DIST_TIMEOUT/3600)) hours)"
+
+        # 从外部 .pth 权重 load_from 续训时，不要使用 --resume auto。
+        # 否则会优先从 work_dir 自动找 checkpoint（常见为 pytorch_model.bin），
+        # DeepSpeed 会按 checkpoint 目录/格式解析，导致 ckpt_list 为空触发断言错误。
+        # 仅当 work_dir 下存在 iter_*.pth / latest.pth 等 mmengine checkpoint 时，才启用 auto resume。
+        resume_arg=()
+        if ls "$work_dir"/iter_*.pth >/dev/null 2>&1 || [ -f "$work_dir/latest.pth" ]; then
+            resume_arg=(--resume auto)
+            echo -e "$log_format Found mmengine checkpoint in work_dir, using --resume auto"
+        else
+            echo -e "$log_format No mmengine checkpoint in work_dir, using config load_from (resume=False)"
+        fi
+
         PYTHONPATH="$(realpath $code_dir)":$PYTHONPATH OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
             torchrun --master_addr=$master_addr --master_port=$master_port --nproc_per_node=$gpu_per_node \
             $code_dir/xsam/tools/train.py \
             $config_file \
             --work-dir $work_dir \
-            --resume auto \
+            "${resume_arg[@]}" \
             --launcher pytorch \
             --deepspeed $deepspeed_config \
             --seed 1024 | { [ $node_rank = "0" ] && tee $work_dir/${mode}-${time}.log || cat; }

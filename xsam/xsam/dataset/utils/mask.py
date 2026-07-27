@@ -40,6 +40,19 @@ def decode_mask(segmentation, height, width):
     return binary_mask
 
 
+def is_segmentation_decodable(segmentation, height, width):
+    """Return True if ``decode_mask`` can successfully decode the segmentation."""
+    if segmentation is None:
+        return False
+    if isinstance(segmentation, list) and len(segmentation) == 0:
+        return False
+    try:
+        decode_mask(segmentation, height, width)
+        return True
+    except Exception:
+        return False
+
+
 def encode_mask(mask, encoding="ascii"):
     assert set(np.unique(mask)).issubset({0, 1})
     rle = mask_utils.encode(np.asfortranarray(mask, dtype=np.uint8))

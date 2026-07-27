@@ -44,19 +44,20 @@ import xsam.engine.runners.loops
 #######################################################################
 #                          PART 1  Settings                           #
 #######################################################################
-# v32: 自 s3.1/v31 (iter_134072) 短续训
-# - 仅 ovseg 开类名同义词（keep_prob=0.5），genseg 仍用原名锚词表
-# - genseg sample_num=24；ovseg sample_num=32 + 子集分支概率 0.7
-# - ovseg 略提权；imgconv/refseg/reaseg 配比不变
-# - 较低 lr + 不 reinit_decoder，保其它任务
-base_root = "/mnt/si001883vtjl/"
-#base_root = "/mnt_llm_A100_V1/"
+# v32-4xA40: 与 v32_ov_synonym_16A100 同策略，适配单机 4×A40
+# - 仅 ovseg 开类名同义词（keep_prob=0.5），genseg 原名锚全表
+# - ovseg sample_num=32 + variant_subset_prob=0.7，repeats=4.0
+# - micro_batch=1 防 SAM 1024² + dual_encoder OOM；全局 BS=4*1*8=32
+# - lr 按 sqrt(32/128) 从 16A100 的 2e-5 缩到 1e-5
+# - load 合并权重 pytorch_model.bin（单机友好）；不覆盖 v3.1 目录
+base_root = "/mnt_llm_A100_V1/"
+# base_root = "/mnt/si001883vtjl/"  # 集群挂载时改用这个
 code_dir = getenv("CODE_DIR", "./xsam/")
 data_dir = getenv("DATA_DIR", "./datas/")
 init_dir = getenv("INIT_DIR", "./inits/")
 work_dir = getenv(
     "WORK_DIR",
-    base_root + "shui/LAE/OneTerra-train/checkpoints/xsam_finetune_v32_ov_synonym_16A100",
+    base_root + "shui/LAE/OneTerra-train/wkdrs_v3.2_20260716",
 )
 # 预训练权重目录（s1/s2），与 work_dir 分离：work_dir 仅用于本次训练输出
 checkpoint_dir = base_root + "shui/LAE/OneTerra-train/checkpoints/"
@@ -68,7 +69,7 @@ seg_decoder_name_or_path = init_dir + "mask2former-swin-large-coco-panoptic"
 
 s1_pretrained_pth = checkpoint_dir + "s1_seg_finetune/pytorch_model.bin"
 s2_pretrained_pth = checkpoint_dir + "xsam_s2_align_pretrain_skyscript_sar/iter_35874.pth"
-# 续训起点：v31 / s3.1_134072（可用 PREV_S3_CKPT 覆盖为 pytorch_model.bin）
+# 续训起点：v31 合并权重（也可用 PREV_S3_CKPT 覆盖）
 prev_s3_ckpt = getenv(
     "PREV_S3_CKPT",
     base_root + "shui/LAE/OneTerra-train/wkdrs_optimization_20260629_v3.1/iter_134072.pth",
@@ -93,21 +94,21 @@ llm_lora_config = dict(
 prompt_template = PROMPT_TEMPLATE.phi3_chat
 max_length = int(4096 - (384 / 14) ** 2 - 1024)
 
-# 🚀 16/32卡 A100：同义词对齐短续训（全局 BS 与 v31 一致时可保持）
-batch_size = 2
-accumulative_counts = 4
+# 🚀 4×A40 单机：micro_batch=1 防 OOM；accum=8 → 全局 BS=32
+batch_size = 1
+accumulative_counts = 8
 dataloader_num_workers = 2
-max_epochs = 1             # 短续训 1 epoch；不够再加
+max_epochs = 1             # 短续训；可改 0.5 先试
 optim_type = AdamW
-lr = 2e-5                  # 低于 v31，避免冲掉其它任务
+lr = 1e-5                  # 相对 16A100@2e-5、全局BS128 → sqrt 缩放到 BS32
 betas = (0.9, 0.999)
 weight_decay = 0.05
 max_norm = 1
 warmup_ratio = 0.03
 
-save_steps = 2000
+save_steps = 1000          # 卡少、iter 更密，存盘稍勤一点
 save_total_limit = 8
-logging_interval = 100
+logging_interval = 50
 
 #######################################################################
 #            PART 2  Model & Tokenizer & Image Processor              #
@@ -361,7 +362,7 @@ optim_wrapper = dict(
     paramwise_cfg=dict(
         bypass_duplicate=True,
         custom_keys={
-            # 🛡️ 绝对核心：主干保护伞，防止SOTA底座遗忘 (实际 lr = 4e-6)
+            # 主干保护：实际 lr = 1e-5 * 0.1 = 1e-6
             "segmentor.encoder": dict(lr_mult=0.1, decay_mult=1.0),
             "visual_encoder": dict(lr_mult=0.1, decay_mult=1.0),
         },
