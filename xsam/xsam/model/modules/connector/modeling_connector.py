@@ -128,11 +128,12 @@ class ConnectorModel(PreTrainedModel):
 
     def enable_input_require_grads(self):
         def make_inputs_require_grad(module, input, outputs):
+            # Same as projector: do not clobber tensors that already have grad_fn.
             if isinstance(outputs, (list, tuple)):
                 for output in outputs:
-                    if isinstance(output, torch.Tensor):
+                    if isinstance(output, torch.Tensor) and not output.requires_grad:
                         output.requires_grad_(True)
-            else:
+            elif isinstance(outputs, torch.Tensor) and not outputs.requires_grad:
                 outputs.requires_grad_(True)
 
         for layer in self.model:

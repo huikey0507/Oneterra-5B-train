@@ -29,7 +29,12 @@ class DynamicProjectorModel(PreTrainedModel):
 
     def enable_input_require_grads(self):
         def make_inputs_require_grad(module, input, output):
-            output.requires_grad_(True)
+            # Only force requires_grad when output is disconnected (e.g. frozen
+            # projector). If output already has grad_fn (trainable projector),
+            # calling requires_grad_(True) can turn it into a leaf and silently
+            # kill weight gradients — especially with gradient checkpointing.
+            if not output.requires_grad:
+                output.requires_grad_(True)
 
         self.model.register_forward_hook(make_inputs_require_grad)
 

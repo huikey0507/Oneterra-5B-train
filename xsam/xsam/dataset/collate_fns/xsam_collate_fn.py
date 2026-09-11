@@ -28,6 +28,7 @@ def xsam_collate_fn(
     has_class_label = any(inst.get("class_labels") is not None for inst in instances)
     has_sampled_labels = any(inst.get("sampled_labels") is not None for inst in instances)
     has_contiguous_labels = any(inst.get("contiguous_labels") is not None for inst in instances)
+    has_modality = any(inst.get("modality") is not None for inst in instances)
 
     if use_varlen_attn:
         position_ids, cumulative_len = [], []
@@ -63,6 +64,8 @@ def xsam_collate_fn(
         sampled_labels = []
     if has_contiguous_labels:
         contiguous_labels = []
+    if has_modality:
+        modalities = []
 
     for example in instances:
         if has_input_ids:
@@ -95,6 +98,8 @@ def xsam_collate_fn(
             sampled_labels.append(example.get("sampled_labels"))
         if has_contiguous_labels:
             contiguous_labels.append(example.get("contiguous_labels"))
+        if has_modality:
+            modalities.append(int(example.get("modality", 0)))
 
     if len(instances) > 1:
         if has_input_ids:
@@ -194,6 +199,9 @@ def xsam_collate_fn(
 
     if has_contiguous_labels:
         data_samples.contiguous_labels = contiguous_labels
+
+    if has_modality:
+        data_dict["modality"] = torch.tensor(modalities, dtype=torch.long)
 
     if return_hf_format:
         return data_dict

@@ -123,7 +123,11 @@ class OVSegDataset(GenericSegDataset):
             for _img_info, _ann_info in zip(coco_data["images"], coco_data["annotations"]):
                 img_id = _img_info["id"]
                 assert _img_info["id"] == _ann_info["image_id"]
-                seg_map_path = _img_info["file_name"].replace(".jpg", ".png")
+                # Prefer COCO panoptic ann file_name (always .png). Do NOT only
+                # replace ".jpg" — SARDET also uses .bmp/.png RGB images.
+                seg_map_path = _ann_info.get("file_name") or (
+                    osp.splitext(_img_info["file_name"])[0] + ".png"
+                )
 
                 if cap_coco_api is not None:
                     cap_ann_ids = cap_coco_api.getAnnIds(imgIds=[img_id])

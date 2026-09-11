@@ -6,6 +6,8 @@ from .inter_seg_dataset import InterSegDataset
 from .ov_seg_dataset import OVSegDataset
 from .reason_seg_dataset import ReasonSegDataset
 from .refer_seg_dataset import ReferSegDataset
+from .sar_ov_seg_dataset import SarOVSegDataset
+from .sar_pano_seg_dataset import SarPanoSegDataset
 from .vgd_seg_dataset import VGDSegDataset
 
 # Alias for backward compatibility
@@ -26,4 +28,6 @@ __all__ = [
     "ReasonSegDataset",
     "OVSegDataset",
     "InterSegDataset",
+    "SarPanoSegDataset",
+    "SarOVSegDataset",
 ]

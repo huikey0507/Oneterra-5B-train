@@ -3,10 +3,11 @@ import os.path as osp
 from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import accumulate, chain
-from typing import Dict, Literal, Optional
+from typing import Dict, List, Literal, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmengine import print_log
 from mmengine.config import Config, ConfigDict
 from mmengine.dist import get_rank
@@ -33,6 +34,8 @@ from ..model.modules import (
     ConnectorModel,
     DynamicProjectorConfig,
     DynamicProjectorModel,
+    ModalityRouter,
+    SarCondAdapter,
     SamplerConfig,
     SamplerModel,
 )
@@ -69,12 +72,16 @@ class XSamModel(BaseModel):
         freeze_visual_encoder=False,
         freeze_segmentor_encoder=False,
         freeze_segmentor_connector=False,
+        freeze_segmentor_decoder=False,
         visual_select_layer=-2,
         visual_select_indx=0,  # 1 for clip, 0 for siglip
         seg_select_layers=[8, 16, 24, 32],
         extract_seg_embeds=True,
         s1_pretrained_pth=None,
         s2_pretrained_pth=None,
+        # Optional: overlay SAR adapters (ZeRO tag dir / .bin / state_dict) after S3/s2 load.
+        # Needed when Stage A only saved sar_* + router, while Stage B must start from full S3.
+        sar_adapter_pth=None,
         projector_depth=2,
         downsample_ratio=0.5,
         llm_lora=None,
@@ -89,6 +96,15 @@ class XSamModel(BaseModel):
         use_dual_encoder=False,
         use_vision_sampler=False,
         use_activation_checkpointing=True,
+        use_sar_adapters=False,
+        freeze_optical_adapters=False,
+        freeze_sar_projectors=False,
+        use_sar_cond_adapter=False,
+        sar_cond_adapter_hidden_dim=256,
+        sar_cond_adapter_residual_scale: float = 1.0,
+        sar_router_hidden_dim=256,
+        sar_gate_loss_weight: float = 0.1,
+        sar_infer_threshold: float = 0.5,
         max_position_embeddings=None,
         llm_loss_weight: float = 1.0,
         seg_loss_weight: float = 1.0,
@@ -98,6 +114,16 @@ class XSamModel(BaseModel):
         self.freeze_visual_encoder = freeze_visual_encoder
         self.freeze_segmentor_encoder = freeze_segmentor_encoder
         self.freeze_segmentor_connector = freeze_segmentor_connector
+        self.freeze_segmentor_decoder = freeze_segmentor_decoder
+        self.use_sar_adapters = use_sar_adapters
+        self.freeze_optical_adapters = freeze_optical_adapters
+        self.freeze_sar_projectors = freeze_sar_projectors
+        self.use_sar_cond_adapter = use_sar_cond_adapter
+        self.sar_gate_loss_weight = sar_gate_loss_weight
+        self.sar_infer_threshold = float(sar_infer_threshold)
+        self._modality_gate_cache = None
+        self._modality_label_cache = None
+        self._route_weight_cache = None
 
         assert (
             llm is not None or visual_encoder is not None or segmentor is not None
@@ -173,14 +199,34 @@ class XSamModel(BaseModel):
             if self.segmentor.decoder is not None and self.segmentor.open_cls:
                 self.bg_embeds = nn.Embedding(1, self.segmentor.dec_config.hidden_size).to(self.segmentor.dtype)
 
+        # SAR dual-path adapters (copy-init from optical after s1/s2 load)
+        if self.use_sar_adapters:
+            self._build_sar_adapters(
+                projector_depth=projector_depth,
+                downsample_ratio=downsample_ratio,
+                connector_type=connector_type,
+                connector_hidden_dim=connector_hidden_dim,
+                connector_scale_factor=connector_scale_factor,
+                use_sar_cond_adapter=use_sar_cond_adapter,
+                sar_cond_adapter_hidden_dim=sar_cond_adapter_hidden_dim,
+                sar_cond_adapter_residual_scale=sar_cond_adapter_residual_scale,
+                sar_router_hidden_dim=sar_router_hidden_dim,
+            )
+
         if self.freeze_llm and self.llm is not None:
             self.llm.requires_grad_(False)
         if self.freeze_visual_encoder and self.visual_encoder is not None:
             self.visual_encoder.requires_grad_(False)
         if self.freeze_segmentor_encoder and self.segmentor is not None:
             self.segmentor.encoder.requires_grad_(False)
-        if self.freeze_segmentor_connector and self.segmentor is not None:
+        if self.freeze_segmentor_connector and hasattr(self, "seg_connector"):
             self.seg_connector.requires_grad_(False)
+        if self.freeze_segmentor_decoder and self.segmentor is not None:
+            self._freeze_segmentor_decoder()
+        if self.freeze_optical_adapters:
+            self._freeze_optical_adapters()
+        if self.freeze_sar_projectors:
+            self._freeze_sar_projectors()
 
         if use_activation_checkpointing:
             # For backward compatibility
@@ -210,6 +256,12 @@ class XSamModel(BaseModel):
                     self.llm_projector.enable_input_require_grads()
                 if hasattr(self, "seg_connector"):
                     self.seg_connector.enable_input_require_grads()
+                if hasattr(self, "sar_visual_projector"):
+                    self.sar_visual_projector.enable_input_require_grads()
+                if hasattr(self, "sar_seg_projector"):
+                    self.sar_seg_projector.enable_input_require_grads()
+                if hasattr(self, "sar_seg_connector"):
+                    self.sar_seg_connector.enable_input_require_grads()
             # enable gradient (activation) checkpointing for memory efficiency
             self.gradient_checkpointing_enable()
         else:
@@ -247,6 +299,7 @@ class XSamModel(BaseModel):
             print_log(f"Matched keys: {len(matched_keys)} / {len(filtered_pretrained_dict.keys())}", logger="current")
             print_log(f"Skipped class_predictor weights due to class number mismatch", logger="current")
 
+        s2_has_sar = False
         if s2_pretrained_pth is not None:
             pretrained_state_dict = guess_load_checkpoint(s2_pretrained_pth)
             self.load_state_dict(pretrained_state_dict, strict=False)
@@ -254,6 +307,13 @@ class XSamModel(BaseModel):
             matched_keys = [k for k in pretrained_state_dict.keys() if k in state_dict.keys()]
             print_log(f"Load s2_pretrained_pth from {s2_pretrained_pth}", logger="current")
             print_log(f"Matched keys: {len(matched_keys)} / {len(pretrained_state_dict.keys())}", logger="current")
+            s2_has_sar = any(
+                ("sar_visual_projector." in k)
+                or ("sar_seg_projector." in k)
+                or ("sar_seg_connector." in k)
+                or ("sar_cond_adapter." in k)
+                for k in pretrained_state_dict.keys()
+            )
 
         self.visual_select_layer = visual_select_layer
         self.visual_select_indx = visual_select_indx
@@ -263,6 +323,300 @@ class XSamModel(BaseModel):
         self.cond_type = cond_type
         self.llm_loss_weight = llm_loss_weight
         self.seg_loss_weight = seg_loss_weight
+
+        # SAR init policy:
+        # 1) If sar_adapter_pth is given (str or list): optical→SAR copy, then overlay adapters
+        #    in order (e.g. Stage A projectors, then Stage B connector).
+        # 2) Else if s2 already has SAR keys: keep them (do NOT wipe with optical copy).
+        # 3) Else: optical→SAR copy as cold start.
+        if self.use_sar_adapters:
+            if isinstance(sar_adapter_pth, (list, tuple)):
+                adapter_paths = [p for p in sar_adapter_pth if p]
+            elif sar_adapter_pth is not None:
+                adapter_paths = [sar_adapter_pth]
+            else:
+                adapter_paths = []
+
+            if adapter_paths:
+                self._copy_optical_to_sar()
+                print_log(
+                    "Initialized SAR adapters by copying optical projector/connector weights "
+                    f"(will overlay {len(adapter_paths)} sar_adapter_pth)",
+                    logger="current",
+                )
+                for path in adapter_paths:
+                    self._load_sar_adapter_checkpoint(path)
+            elif s2_has_sar:
+                print_log(
+                    "Keeping SAR adapters loaded from s2_pretrained_pth; skip optical→SAR overwrite",
+                    logger="current",
+                )
+            else:
+                self._copy_optical_to_sar()
+                print_log(
+                    "Initialized SAR adapters by copying optical projector/connector weights",
+                    logger="current",
+                )
+
+    def _load_sar_adapter_checkpoint(self, sar_adapter_pth):
+        """Load Stage-A SAR adapters (and router) on top of optical/S3 init.
+
+        Accepts:
+          - DeepSpeed ZeRO tag dir (`iter_*.pth/` with mp_rank_00_model_states.pt)
+          - flat `.bin` / `.pth` state_dict
+        Only keys under sar_* / modality_router are applied.
+        """
+        import os.path as osp
+
+        path = sar_adapter_pth
+        if osp.isdir(path):
+            candidate = osp.join(path, "mp_rank_00_model_states.pt")
+            if not osp.isfile(candidate):
+                raise FileNotFoundError(f"sar_adapter_pth dir has no mp_rank_00_model_states.pt: {path}")
+            path = candidate
+
+        raw = guess_load_checkpoint(path)
+        # DeepSpeed tag file: prefer the flat weight dict under "module".
+        if isinstance(raw, dict) and "module" in raw and isinstance(raw["module"], dict):
+            raw = raw["module"]
+        elif not isinstance(raw, dict):
+            raise RuntimeError(f"Unsupported sar_adapter_pth format: {sar_adapter_pth}")
+
+        adapter_prefixes = (
+            "sar_visual_projector.",
+            "sar_seg_projector.",
+            "sar_seg_connector.",
+            "sar_cond_adapter.",
+            "modality_router.",
+        )
+        filtered = {}
+        for k, v in raw.items():
+            if not torch.is_tensor(v):
+                continue
+            nk = k[len("module.") :] if k.startswith("module.") else k
+            if any(nk.startswith(p) for p in adapter_prefixes):
+                filtered[nk] = v
+
+        if not filtered:
+            raise RuntimeError(f"No SAR adapter keys found in {sar_adapter_pth}")
+
+        incompatible = super(XSamModel, self).load_state_dict(filtered, strict=False)
+        print_log(
+            f"Load sar_adapter_pth from {sar_adapter_pth}: {len(filtered)} adapter tensors "
+            f"(unexpected={list(getattr(incompatible, 'unexpected_keys', []) or [])[:8]})",
+            logger="current",
+        )
+
+    def load_state_dict(self, state_dict, strict=True):
+        incompatible = super().load_state_dict(state_dict, strict=False)
+        if self.use_sar_adapters:
+            has_sar = any(
+                ("sar_visual_projector." in k)
+                or ("sar_seg_projector." in k)
+                or ("sar_seg_connector." in k)
+                or ("sar_cond_adapter." in k)
+                for k in state_dict.keys()
+            )
+            if not has_sar:
+                self._copy_optical_to_sar()
+                print_log(
+                    "Checkpoint has no SAR adapter keys; re-copied optical → SAR after load_state_dict",
+                    logger="current",
+                )
+        return incompatible
+
+    def _build_sar_adapters(
+        self,
+        projector_depth,
+        downsample_ratio,
+        connector_type,
+        connector_hidden_dim,
+        connector_scale_factor,
+        use_sar_cond_adapter,
+        sar_cond_adapter_hidden_dim,
+        sar_cond_adapter_residual_scale,
+        sar_router_hidden_dim,
+    ):
+        if hasattr(self, "visual_projector"):
+            sar_vis_cfg = DynamicProjectorConfig(
+                visual_hidden_size=self.visual_encoder.config.hidden_size,
+                llm_hidden_size=self.llm.config.hidden_size,
+                depth=projector_depth,
+            )
+            self.sar_visual_projector = DynamicProjectorModel(sar_vis_cfg).to(self.visual_encoder.dtype)
+
+        if hasattr(self, "seg_projector"):
+            sar_seg_proj_cfg = DynamicProjectorConfig(
+                visual_hidden_size=self.segmentor.enc_config.hidden_size,
+                llm_hidden_size=self.llm.config.hidden_size,
+                downsample_ratio=downsample_ratio,
+                depth=projector_depth,
+            )
+            self.sar_seg_projector = DynamicProjectorModel(sar_seg_proj_cfg).to(self.segmentor.dtype)
+
+        if hasattr(self, "seg_connector"):
+            n_levels = self.segmentor.dec_config.num_feature_levels
+            sar_conn_cfg = ConnectorConfig(
+                segmentor_encoder_channels=[self.segmentor.enc_config.hidden_size] * n_levels,
+                hidden_channels=connector_hidden_dim,
+                scale_factor=connector_scale_factor[-n_levels:],
+                connector_type=connector_type,
+            )
+            self.sar_seg_connector = ConnectorModel(sar_conn_cfg).to(self.segmentor.dtype)
+
+        if use_sar_cond_adapter and self.segmentor is not None and self.segmentor.decoder is not None:
+            self.sar_cond_adapter = SarCondAdapter(
+                embed_dim=self.segmentor.dec_config.hidden_size,
+                hidden_dim=sar_cond_adapter_hidden_dim,
+                residual_scale=sar_cond_adapter_residual_scale,
+            ).to(self.segmentor.dtype)
+
+        if self.visual_encoder is not None:
+            self.modality_router = ModalityRouter(
+                in_dim=self.visual_encoder.config.hidden_size,
+                hidden_dim=sar_router_hidden_dim,
+            ).to(self.visual_encoder.dtype)
+
+        print_log(
+            "Built SAR adapters: "
+            f"visual={hasattr(self, 'sar_visual_projector')}, "
+            f"seg_proj={hasattr(self, 'sar_seg_projector')}, "
+            f"connector={hasattr(self, 'sar_seg_connector')}, "
+            f"cond_adapter={hasattr(self, 'sar_cond_adapter')}, "
+            f"router={hasattr(self, 'modality_router')}",
+            logger="current",
+        )
+
+    def _copy_optical_to_sar(self):
+        if hasattr(self, "sar_visual_projector") and hasattr(self, "visual_projector"):
+            self.sar_visual_projector.load_state_dict(self.visual_projector.state_dict())
+        if hasattr(self, "sar_seg_projector") and hasattr(self, "seg_projector"):
+            self.sar_seg_projector.load_state_dict(self.seg_projector.state_dict())
+        if hasattr(self, "sar_seg_connector") and hasattr(self, "seg_connector"):
+            self.sar_seg_connector.load_state_dict(self.seg_connector.state_dict())
+
+    def _freeze_optical_adapters(self):
+        if hasattr(self, "visual_projector"):
+            self.visual_projector.requires_grad_(False)
+        if hasattr(self, "seg_projector"):
+            self.seg_projector.requires_grad_(False)
+        if hasattr(self, "seg_connector"):
+            self.seg_connector.requires_grad_(False)
+        # Shared language→seg head: keep frozen while adapting SAR branches.
+        if hasattr(self, "llm_projector"):
+            self.llm_projector.requires_grad_(False)
+        print_log("Froze optical projectors/connector and llm_projector", logger="current")
+
+    def _freeze_sar_projectors(self):
+        if hasattr(self, "sar_visual_projector"):
+            self.sar_visual_projector.requires_grad_(False)
+        if hasattr(self, "sar_seg_projector"):
+            self.sar_seg_projector.requires_grad_(False)
+        print_log("Froze SAR visual/seg projectors (keep training sar_seg_connector/router)", logger="current")
+
+    def _freeze_segmentor_decoder(self):
+        """Freeze Mask2Former / mask-decoder head so optical seg path weights stay fixed.
+
+        Gradients can still flow through these modules into trainable adapters
+        (e.g. sar_seg_connector) because requires_grad_(False) does not block
+        backward to earlier tensors.
+        """
+        if self.segmentor is None:
+            return
+        frozen = []
+        for name in ("decoder", "pixel_decoder", "class_predictor"):
+            module = getattr(self.segmentor, name, None)
+            if module is not None and hasattr(module, "requires_grad_"):
+                module.requires_grad_(False)
+                frozen.append(name)
+        logit_scale = getattr(self.segmentor, "logit_scale", None)
+        if isinstance(logit_scale, torch.nn.Parameter):
+            logit_scale.requires_grad_(False)
+            frozen.append("logit_scale")
+        # XSam-side embeds used by open-vocab / sampler heads
+        if hasattr(self, "bg_embeds"):
+            self.bg_embeds.requires_grad_(False)
+            frozen.append("bg_embeds")
+        if hasattr(self, "vision_sampler"):
+            self.vision_sampler.requires_grad_(False)
+            frozen.append("vision_sampler")
+        print_log(
+            f"Froze segmentor decoder/M2F modules for optical-path fidelity: {frozen}",
+            logger="current",
+        )
+
+    @staticmethod
+    def _mix_by_weight(opt_out, sar_out, weight):
+        """Mix opt/sar tensors with per-sample weight in [0,1], shape [B]."""
+        w = weight
+        while w.dim() < opt_out.dim():
+            w = w.unsqueeze(-1)
+        w = w.to(device=opt_out.device, dtype=opt_out.dtype)
+        return (1.0 - w) * opt_out + w * sar_out
+
+    def _route_module_out(self, opt_out, sar_out, route_weight):
+        if sar_out is None:
+            return opt_out
+        if isinstance(opt_out, (list, tuple)):
+            return [self._mix_by_weight(o, s, route_weight) for o, s in zip(opt_out, sar_out)]
+        return self._mix_by_weight(opt_out, sar_out, route_weight)
+
+    def _get_route_weight(self, vis_tokens, modality, batch_size, device, dtype):
+        """
+        Training with modality labels: hard route by GT (0/1).
+        Blind inference: hard threshold on modality_router prob (aligns with train).
+        Soft gate probs are still cached for loss_gate during training.
+        """
+        gate = None
+        if hasattr(self, "modality_router") and vis_tokens is not None:
+            # Router is supervised only by BCE; detach visual features to avoid
+            # leaking gate gradients into the frozen/shared vision backbone.
+            gate = self.modality_router(vis_tokens.detach())
+
+        if modality is not None:
+            if not torch.is_tensor(modality):
+                modality = torch.tensor(modality, device=device)
+            modality = modality.to(device=device).long().view(-1)
+            if modality.numel() == 1 and batch_size > 1:
+                modality = modality.expand(batch_size)
+            self._modality_label_cache = modality
+            self._modality_gate_cache = gate
+            # Train/eval with labels: hard route by GT modality (optical path untouched for opt samples).
+            route_weight = modality.float()
+            self._route_weight_cache = route_weight
+            return route_weight
+
+        self._modality_label_cache = None
+        self._modality_gate_cache = gate
+        if gate is not None:
+            # Blind inference: router-driven hard threshold (matches hard-route training).
+            route_weight = (gate > self.sar_infer_threshold).to(dtype=dtype)
+            self._route_weight_cache = route_weight
+            return route_weight
+        route_weight = torch.zeros(batch_size, device=device, dtype=dtype)
+        self._route_weight_cache = route_weight
+        return route_weight
+
+    def _apply_sar_cond_adapter(self, cond_embeds, local_cond_lens=None):
+        if cond_embeds is None or not hasattr(self, "sar_cond_adapter"):
+            return cond_embeds
+        route_weight = self._route_weight_cache
+        if route_weight is None:
+            return cond_embeds
+
+        adapted_cond_embeds = self.sar_cond_adapter(cond_embeds)
+        if not torch.is_tensor(cond_embeds):
+            return adapted_cond_embeds
+
+        if cond_embeds.shape[0] == route_weight.numel():
+            return self._mix_by_weight(cond_embeds, adapted_cond_embeds, route_weight)
+
+        if local_cond_lens is not None and sum(local_cond_lens) == cond_embeds.shape[0]:
+            repeat_counts = torch.tensor(local_cond_lens, device=route_weight.device, dtype=torch.long)
+            expanded_route_weight = torch.repeat_interleave(route_weight.view(-1), repeat_counts, dim=0)
+            return self._mix_by_weight(cond_embeds, adapted_cond_embeds, expanded_route_weight)
+
+        return adapted_cond_embeds
 
     @property
     def device(self):
@@ -471,12 +825,34 @@ class XSamModel(BaseModel):
         if data_samples is not None:
             data_samples = data_sample_to_device(data_samples, device=get_device())
 
+        self._modality_gate_cache = None
+        self._modality_label_cache = None
+        self._route_weight_cache = None
+        modality = data_dict.pop("modality", None)
+
         extra_data_dict = {}
+        route_weight = None
+        vis_tokens_for_router = None
+
         if "pixel_values" in data_dict and self.visual_encoder is not None:
             visual_outputs = self._forward_visual_encoder(data_dict["pixel_values"])
-            pixel_values = self.visual_projector(
-                visual_outputs.hidden_states[self.visual_select_layer][:, self.visual_select_indx :]
-            )
+            vis_tokens = visual_outputs.hidden_states[self.visual_select_layer][:, self.visual_select_indx :]
+            vis_tokens_for_router = vis_tokens
+            opt_pixel_values = self.visual_projector(vis_tokens)
+
+            if self.use_sar_adapters and hasattr(self, "sar_visual_projector"):
+                route_weight = self._get_route_weight(
+                    vis_tokens,
+                    modality,
+                    batch_size=vis_tokens.shape[0],
+                    device=vis_tokens.device,
+                    dtype=opt_pixel_values.dtype,
+                )
+                sar_pixel_values = self.sar_visual_projector(vis_tokens)
+                pixel_values = self._route_module_out(opt_pixel_values, sar_pixel_values, route_weight)
+            else:
+                pixel_values = opt_pixel_values
+
             data_dict["pixel_values"] = pixel_values.to(self.llm.dtype)
             del visual_outputs
 
@@ -491,12 +867,45 @@ class XSamModel(BaseModel):
                 )
                 seg_pixel_values = None
                 if hasattr(self, "seg_projector"):
-                    seg_pixel_values = self.seg_projector(seg_hidden_states[self.visual_select_layer])
+                    opt_seg_pixel_values = self.seg_projector(seg_hidden_states[self.visual_select_layer])
+                    if self.use_sar_adapters and hasattr(self, "sar_seg_projector"):
+                        if route_weight is None:
+                            route_weight = self._get_route_weight(
+                                vis_tokens_for_router,
+                                modality,
+                                batch_size=opt_seg_pixel_values.shape[0],
+                                device=opt_seg_pixel_values.device,
+                                dtype=opt_seg_pixel_values.dtype,
+                            )
+                        sar_seg_pixel_values = self.sar_seg_projector(
+                            seg_hidden_states[self.visual_select_layer]
+                        )
+                        seg_pixel_values = self._route_module_out(
+                            opt_seg_pixel_values, sar_seg_pixel_values, route_weight
+                        )
+                    else:
+                        seg_pixel_values = opt_seg_pixel_values
                     seg_pixel_values = seg_pixel_values.to(self.llm.dtype)
+
                 if hasattr(self, "seg_connector"):
-                    seg_image_embeddings = self.seg_connector(
-                        [seg_hidden_states[i] for i in self.seg_select_layers]
-                    )
+                    selected = [seg_hidden_states[i] for i in self.seg_select_layers]
+                    opt_seg_image_embeddings = self.seg_connector(selected)
+                    if self.use_sar_adapters and hasattr(self, "sar_seg_connector"):
+                        if route_weight is None:
+                            bs = selected[0].shape[0]
+                            route_weight = self._get_route_weight(
+                                vis_tokens_for_router,
+                                modality,
+                                batch_size=bs,
+                                device=selected[0].device,
+                                dtype=opt_seg_image_embeddings[0].dtype,
+                            )
+                        sar_seg_image_embeddings = self.sar_seg_connector(selected)
+                        seg_image_embeddings = self._route_module_out(
+                            opt_seg_image_embeddings, sar_seg_image_embeddings, route_weight
+                        )
+                    else:
+                        seg_image_embeddings = opt_seg_image_embeddings
                 elif self.segmentor.pixel_decoder is not None and hasattr(seg_visual_outputs, "feature_maps"):
                     seg_image_embeddings = seg_visual_outputs.feature_maps
 
@@ -515,6 +924,12 @@ class XSamModel(BaseModel):
                 data_dict["seg_pixel_values"] = None
         else:
             data_dict["seg_pixel_values"] = None
+
+        # If only modality labels exist without visual tokens (edge case), still cache labels for loss.
+        if modality is not None and self._modality_label_cache is None:
+            if not torch.is_tensor(modality):
+                modality = torch.tensor(modality)
+            self._modality_label_cache = modality.long().view(-1)
 
         if data_dict.get("vprompt_masks", None) is not None and hasattr(self, "vision_sampler"):
             vprompt_masks = data_dict.pop("vprompt_masks")
@@ -535,7 +950,6 @@ class XSamModel(BaseModel):
             data_dict = prepare_inputs_labels_for_multimodal(llm=self.llm, **data_dict)
 
         data_dict.update(extra_data_dict)
-        #print(f"🔍 forward中合并后data_dict包含: seg_image_embeddings = {[feat.shape for feat in data_dict.get('seg_image_embeddings', [])] if data_dict.get('seg_image_embeddings') is not None else None}")
 
         if mode == "loss":
             return self.compute_loss(data_dict, data_samples, **kwargs)
@@ -603,6 +1017,7 @@ class XSamModel(BaseModel):
                 cond_embeds, seg_embeds, embed_masks, local_cond_lens, global_cond_lens = self._process_embeds(
                     cond_embeds, seg_embeds, task_names[0]
                 )
+                cond_embeds = self._apply_sar_cond_adapter(cond_embeds, local_cond_lens)
 
         if (local_cond_lens or global_cond_lens) is not None and mask_labels is not None:
             cur_rank = get_rank()
@@ -795,6 +1210,7 @@ class XSamModel(BaseModel):
                 cond_embeds, seg_embeds, embed_masks, local_cond_lens, _ = self._process_embeds(
                     cond_embeds, seg_embeds, task_names[0]
                 )
+                cond_embeds = self._apply_sar_cond_adapter(cond_embeds, local_cond_lens)
 
         if (cond_embeds is not None and seg_embeds is not None) or llm_outputs is None:
             if seg_embeds is not None and seg_embeds.shape[1] != 1:
@@ -845,6 +1261,20 @@ class XSamModel(BaseModel):
         else:
             raise ValueError("llm_outputs and seg_outputs are both None")
 
+        if (
+            self.use_sar_adapters
+            and self._modality_gate_cache is not None
+            and self._modality_label_cache is not None
+            and self.sar_gate_loss_weight > 0
+        ):
+            gate = self._modality_gate_cache.float().view(-1)
+            label = self._modality_label_cache.float().view(-1).to(device=gate.device)
+            if gate.numel() == label.numel():
+                loss_gate = F.binary_cross_entropy(gate, label) * self.sar_gate_loss_weight
+                loss = loss + loss_gate
+                loss_dict["loss"] = loss
+                loss_dict["loss_gate"] = loss_gate
+
         return loss_dict
 
     def state_dict(self, *args, **kwargs):
@@ -879,6 +1309,12 @@ class XSamModel(BaseModel):
         to_return.update({k: v for k, v in state_dict.items() if "llm_projector." in k})
         # Step 5. seg_connector
         to_return.update({k: v for k, v in state_dict.items() if "seg_connector." in k})
+        # Step 5b. SAR adapters + router
+        to_return.update({k: v for k, v in state_dict.items() if "sar_visual_projector." in k})
+        to_return.update({k: v for k, v in state_dict.items() if "sar_seg_projector." in k})
+        to_return.update({k: v for k, v in state_dict.items() if "sar_seg_connector." in k})
+        to_return.update({k: v for k, v in state_dict.items() if "sar_cond_adapter." in k})
+        to_return.update({k: v for k, v in state_dict.items() if "modality_router." in k})
         # Step 6. other embeds
         to_return.update({k: v for k, v in state_dict.items() if "bg_embeds." in k})
         to_return.update({k: v for k, v in state_dict.items() if "vgd_embeds." in k})
@@ -923,15 +1359,25 @@ class XSamModel(BaseModel):
             self.llm.gradient_checkpointing_enable()
         if self.visual_encoder is not None:
             self.visual_encoder.gradient_checkpointing_enable()
-            self.visual_projector.gradient_checkpointing_enable()
+            # Projectors are tiny; checkpointing them with a frozen encoder
+            # (no_grad tokens) silently zeros projector weight grads.
+            # Only checkpoint projector when visual encoder itself is trainable.
+            if not self.freeze_visual_encoder and hasattr(self, "visual_projector"):
+                self.visual_projector.gradient_checkpointing_enable()
+            if not self.freeze_visual_encoder and hasattr(self, "sar_visual_projector"):
+                self.sar_visual_projector.gradient_checkpointing_enable()
         if self.segmentor is not None:
             self.segmentor.gradient_checkpointing_enable({"use_reentrant": False})
-            if hasattr(self, "seg_projector"):
+            if not self.freeze_segmentor_encoder and hasattr(self, "seg_projector"):
                 self.seg_projector.gradient_checkpointing_enable()
             if hasattr(self, "llm_projector"):
                 self.llm_projector.gradient_checkpointing_enable()
-            if hasattr(self, "seg_connector"):
+            if not self.freeze_segmentor_encoder and hasattr(self, "seg_connector"):
                 self.seg_connector.gradient_checkpointing_enable()
+            if not self.freeze_segmentor_encoder and hasattr(self, "sar_seg_projector"):
+                self.sar_seg_projector.gradient_checkpointing_enable()
+            if not self.freeze_segmentor_encoder and hasattr(self, "sar_seg_connector"):
+                self.sar_seg_connector.gradient_checkpointing_enable()
 
     def gradient_checkpointing_disable(self):
         self.activation_checkpointing_disable()
@@ -950,6 +1396,16 @@ class XSamModel(BaseModel):
                 self.llm_projector.gradient_checkpointing_disable()
             if hasattr(self, "seg_connector"):
                 self.seg_connector.gradient_checkpointing_disable()
+            if hasattr(self, "sar_visual_projector"):
+                self.sar_visual_projector.gradient_checkpointing_disable()
+            if hasattr(self, "sar_seg_projector"):
+                self.sar_seg_projector.gradient_checkpointing_disable()
+            if hasattr(self, "sar_seg_connector"):
+                self.sar_seg_connector.gradient_checkpointing_disable()
+            if hasattr(self, "sar_cond_adapter"):
+                disable_fn = getattr(self.sar_cond_adapter, "gradient_checkpointing_disable", None)
+                if callable(disable_fn):
+                    disable_fn()
 
     def init_weights(self):
         pass
@@ -1149,3 +1605,23 @@ class XSamModel(BaseModel):
                 seg_projector_path = osp.join(save_dir, "segmentor_projector")
                 print_log(f"Saving segmentor_projector to {seg_projector_path}", "current")
                 self.seg_projector.save_pretrained(seg_projector_path, **save_pretrained_kwargs)
+            if hasattr(self, "sar_visual_projector"):
+                path = osp.join(save_dir, "sar_visual_projector")
+                print_log(f"Saving sar_visual_projector to {path}", "current")
+                self.sar_visual_projector.save_pretrained(path, **save_pretrained_kwargs)
+            if hasattr(self, "sar_seg_projector"):
+                path = osp.join(save_dir, "sar_segmentor_projector")
+                print_log(f"Saving sar_seg_projector to {path}", "current")
+                self.sar_seg_projector.save_pretrained(path, **save_pretrained_kwargs)
+            if hasattr(self, "sar_seg_connector"):
+                path = osp.join(save_dir, "sar_seg_connector")
+                print_log(f"Saving sar_seg_connector to {path}", "current")
+                self.sar_seg_connector.save_pretrained(path, **save_pretrained_kwargs)
+            if hasattr(self, "sar_cond_adapter"):
+                path = osp.join(save_dir, "sar_cond_adapter.pt")
+                print_log(f"Saving sar_cond_adapter to {path}", "current")
+                torch.save(self.sar_cond_adapter.state_dict(), path)
+            if hasattr(self, "modality_router"):
+                path = osp.join(save_dir, "modality_router.pt")
+                print_log(f"Saving modality_router to {path}", "current")
+                torch.save(self.modality_router.state_dict(), path)

@@ -202,4 +202,5 @@ class ImageConvDataset(BaseDataset):
             data_dict.update(self._get_input_ids(data_dict, with_image_token=False))
         else:
             data_dict.update(self._get_input_ids(data_dict, with_image_token=True))
+        data_dict.setdefault("modality", getattr(self, "modality", 0))
         return data_dict

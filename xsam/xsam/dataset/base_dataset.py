@@ -207,6 +207,8 @@ class BaseDataset(Dataset):
         self.output_ids_with_output = output_ids_with_output
         self.cond_type = cond_type
         self.repeats_scale = repeats_scale
+        # 0=optical, 1=SAR; used by SAR dual-path routing
+        self.modality = int(kwargs.get("modality", 0))
         self.repeats = 1.0
 
         if isinstance(tokenizer, dict) or isinstance(tokenizer, Config) or isinstance(tokenizer, ConfigDict):
@@ -319,6 +321,11 @@ class BaseDataset(Dataset):
 
     def custom_init(self, **kwargs):
         pass
+
+    def _attach_modality(self, data_dict):
+        if isinstance(data_dict, dict):
+            data_dict.setdefault("modality", getattr(self, "modality", 0))
+        return data_dict
 
     def _set_metadata(self, **kwargs):
         metadata = MetadataCatalog.get(f"{self.data_name}")
@@ -439,7 +446,7 @@ class BaseDataset(Dataset):
                 data_dict.update(self._get_input_ids(data_dict, with_image_token=False))
                 data_dict.update(self._get_cond_ids(data_dict))
                 data_dict.update(self._get_seg_ids(data_dict))
-            return data_dict
+            return self._attach_modality(data_dict)
 
         # s2/s3：有 image_processor，坏图最多跳过 32 个样本
         max_skip = 32
@@ -504,7 +511,7 @@ class BaseDataset(Dataset):
             data_dict.update(self._get_input_ids(data_dict, with_image_token=True))
             data_dict.update(self._get_cond_ids(data_dict))
             data_dict.update(self._get_seg_ids(data_dict))
-            return data_dict
+            return self._attach_modality(data_dict)
 
         data_dict = copy.deepcopy(self.data[index % self.data_length])
         if hasattr(self.image_processor, "crop_size"):
@@ -531,4 +538,4 @@ class BaseDataset(Dataset):
             raise RuntimeError(
                 f"Unable to load valid image after {max_skip} attempts. Last error: {last_error}"
             ) from last_error
-        return data_dict
+        return self._attach_modality(data_dict)
